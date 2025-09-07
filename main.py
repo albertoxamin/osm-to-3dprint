@@ -1,25 +1,58 @@
+# main.py
 import osmnx as ox
 import shapely
+from shapely.geometry import Polygon, MultiPolygon, LineString, MultiLineString, box
 import numpy as np
 from stl import mesh
+import osmnx, shapely, geopandas, pyproj, networkx
+print("osmnx", osmnx.__version__)
+print("shapely", shapely.__version__)
+from shapely.ops import unary_union
+from shapely.geometry import box as shapely_box
+from shapely.geometry import GeometryCollection
+from shapely.ops import triangulate
+from shapely.geometry import GeometryCollection, MultiPolygon, Polygon
+
+# recommended
+# pip install -U "osmnx>=2.0.2" "shapely>=2.0.4" "geopandas>=0.14" "pyproj>=3.6" "networkx>=3.2"
+
+
+# top of file
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)  # optionally hide OSMnx v2 deprecations
+
+import osmnx as ox
+
+from shapely.geometry import box
+import osmnx as ox
 
 def fetch_building_data(bbox):
-    # Unpack the bounding box
-    north_lat, north_lng, south_lat, south_lng = bbox
+    """
+    bbox = (north, east, south, west)  # your code’s convention
+    OSMnx v2 wants bbox=(left, bottom, right, top) i.e. (west, south, east, north)
+    """
+    north, east, south, west = bbox
+    return ox.features.features_from_bbox(
+        bbox=(west, south, east, north),
+        tags={"building": True}
+    )
 
-    # Fetch building footprints within the bounding box
-    gdf = ox.geometries_from_bbox(north_lat, south_lat, north_lng, south_lng, tags={'building': True})
-    return gdf
+def fetch_road_data(bbox, network_type='drive'):
+    north, east, south, west = bbox
+    # OSMnx v2 expects bbox=(west, south, east, north)
+    bbox_osmnx = (west, south, east, north)
+    G = ox.graph_from_bbox(bbox=bbox_osmnx, network_type=network_type, simplify=True)
+    _, edges = ox.graph_to_gdfs(G)
+    return edges[edges.geometry.type.isin(['LineString', 'MultiLineString'])].copy()
 
 def get_building_height(row, default_height=10):
-    # Check for various height attributes
     height_attrs = ['height', 'building:height', 'building:levels']
     for attr in height_attrs:
         if attr in row:
             height = row[attr]
             if isinstance(height, (int, float)) and not np.isnan(height):
                 if attr == 'building:levels':
-                    return height * 3  # Assuming 3 meters per level
+                    return height * 3  # meters per level assumption
                 return height
             elif isinstance(height, str):
                 try:
@@ -30,102 +63,240 @@ def get_building_height(row, default_height=10):
     return default_height
 
 def create_solid_base(base_size, base_thickness=2):
-    # Define vertices for the base (solid block)
     base_vertices = [
-        (0, 0, 0),  # Bottom face
+        (0, 0, 0),  # bottom rectangle
         (base_size, 0, 0),
         (base_size, base_size, 0),
         (0, base_size, 0),
-        (0, 0, base_thickness),  # Top face (where buildings will sit)
+        (0, 0, base_thickness),  # top rectangle
         (base_size, 0, base_thickness),
         (base_size, base_size, base_thickness),
         (0, base_size, base_thickness)
     ]
-
-    # Define faces for the base
     base_faces = [
-        [0, 1, 5], [0, 5, 4],  # Sides
+        [0, 1, 5], [0, 5, 4],
         [1, 2, 6], [1, 6, 5],
         [2, 3, 7], [2, 7, 6],
         [3, 0, 4], [3, 4, 7],
-        [4, 5, 6], [4, 6, 7],  # Top face
-        [0, 1, 2], [0, 2, 3]   # Bottom face
+        [4, 5, 6], [4, 6, 7],  # top
+        [0, 1, 2], [0, 2, 3]   # bottom
     ]
-
     return base_vertices, base_faces
 
-def scale_coordinates(gdf, bbox, target_size=180, max_height_mm=40, default_height=10, base_thickness=2):
-    # Unpack the bounding box
-    north_lat, north_lng, south_lat, south_lng = bbox
+def _fan_triangulate(loop_indices, faces_out):
+    """
+    Fan-triangulate a simple polygon ring given a list of vertex indices.
+    """
+    if len(loop_indices) < 3:
+        return
+    for i in range(1, len(loop_indices) - 1):
+        faces_out.append([loop_indices[0], loop_indices[i], loop_indices[i + 1]])
 
-    # Calculate the scale factors for x and y dimensions
-    lat_range = north_lat - south_lat
-    lng_range = north_lng - south_lng
+def _add_prism_from_polygon(coords, z0, z1, vertices_out, faces_out):
+    """
+    Given a simple polygon (no holes) as a list of (x,y), add vertical prism between z0 and z1.
+    """
+    base_index = len(vertices_out)
+    # Add vertical pairs
+    for (x, y) in coords[:-1]:  # last point repeats first in shapely; skip duplicate
+        vertices_out.extend([(x, y, z0), (x, y, z1)])
 
-    # Define the base size as 20% larger than the target area
-    base_size = target_size * 1.2    
+    n = (len(coords) - 1)  # number of unique vertices
+    # Side faces
+    for i in range(n):
+        i_next = (i + 1) % n
+        b1 = base_index + 2 * i
+        t1 = base_index + 2 * i + 1
+        b2 = base_index + 2 * i_next
+        t2 = base_index + 2 * i_next + 1
+        faces_out.append([b1, b2, t1])
+        faces_out.append([t1, b2, t2])
 
-    # Calculate scaling factors based on the larger base
-    scale_x = target_size / lng_range
+    # Top and bottom faces (fan)
+    top_indices = [base_index + 2 * i + 1 for i in range(n)]
+    bottom_indices = [base_index + 2 * i for i in range(n)]
+    _fan_triangulate(top_indices, faces_out)
+    _fan_triangulate(bottom_indices, faces_out)
+
+def _add_prism_from_polygon_TRIANGULATED(poly, z0, z1, vertices_out, faces_out):
+    """
+    Robustly extrude a (possibly concave) shapely Polygon by triangulating its face.
+    - Triangulates the 2D area (no holes handled for simplicity/robustness).
+    - Adds top/bottom triangles and a single outer wall.
+    """
+    # --- Top/Bottom via triangulation (safe for concave shapes) ---
+    tris = triangulate(poly)  # list of triangular Polygons covering 'poly'
+    for tri in tris:
+        # each tri has 3 unique points; close ring repeats the first -> skip last
+        tri_coords = list(tri.exterior.coords)[:-1]
+        base_idx = len(vertices_out)
+        # add bottom and top vertices for the triangle
+        for (x, y) in tri_coords:
+            vertices_out.append((x, y, z0))
+        for (x, y) in tri_coords:
+            vertices_out.append((x, y, z1))
+        # bottom face (triangle)
+        faces_out.append([base_idx + 0, base_idx + 1, base_idx + 2])
+        # top face (triangle) - same winding but on the top
+        faces_out.append([base_idx + 3, base_idx + 4, base_idx + 5])
+
+    # --- Outer vertical wall along the exterior ring only ---
+    ext = list(poly.exterior.coords)
+    n = len(ext) - 1
+    wall_base = len(vertices_out)
+    for (x, y) in ext[:-1]:
+        vertices_out.extend([(x, y, z0), (x, y, z1)])
+    for i in range(n):
+        j = (i + 1) % n
+        b1 = wall_base + 2*i
+        t1 = wall_base + 2*i + 1
+        b2 = wall_base + 2*j
+        t2 = wall_base + 2*j + 1
+        faces_out.append([b1, b2, t1])
+        faces_out.append([t1, b2, t2])
+
+def scale_coordinates(
+    gdf_buildings,
+    bbox,
+    target_size=180,
+    max_height_mm=40,
+    default_height=40,
+    base_thickness=2,
+    roads_gdf=None,
+    road_width_mm=14.0,
+    road_height_mm=2.0,
+    EPS= 0.02
+):
+    """
+    Scale buildings and (optionally) roads into model space and build a single mesh.
+    bbox = (north, east, south, west)
+    """
+    north, east, south, west = bbox
+    lat_range = north - south
+    lon_range = east - west
+
+    # Base is a bit larger than model target to frame the city
+    base_size = target_size * 1.2
+    scale_x = target_size / lon_range
     scale_y = target_size / lat_range
-
-    # Calculate offsets to center the buildings on the enlarged base
-    center_offset_x = (base_size - (scale_x * lng_range)) / 2
+    center_offset_x = (base_size - (scale_x * lon_range)) / 2
     center_offset_y = (base_size - (scale_y * lat_range)) / 2
 
-    vertices = []
-    faces = []
+    def to_model_xy(lon, lat):
+        x = ((lon - west) * scale_x) + center_offset_x
+        y = ((lat - south) * scale_y) + center_offset_y
+        return (x, y)
 
-    # Generate and append solid base
+    vertices, faces = [], []
+
+    # 1) Base
     base_vertices, base_faces = create_solid_base(base_size, base_thickness)
     vertices.extend(base_vertices)
     faces.extend(base_faces)
 
-    # Calculate the maximum building height
-    max_building_height = gdf.apply(lambda row: get_building_height(row, default_height), axis=1).max()
-    height_scale = max_height_mm / max_building_height
+    # 2) Buildings
+    if len(gdf_buildings) > 0:
+        max_building_height_m = gdf_buildings.apply(
+            lambda row: get_building_height(row, default_height), axis=1
+        ).max()
+        height_scale = (max_height_mm / max_building_height_m) if max_building_height_m > 0 else 1.0
+    else:
+        height_scale = 1.0
 
-    for idx, row in gdf.iterrows():
-        polygon = row['geometry']
-        if isinstance(polygon, shapely.geometry.Polygon):
-            exterior_coords = list(polygon.exterior.coords)
-            base_index = len(vertices)
-
-            # Create vertices for the building
-            for coord in exterior_coords:
-                x = ((coord[0] - south_lng) * scale_x) + center_offset_x
-                y = ((coord[1] - south_lat) * scale_y) + center_offset_y
+    for _, row in gdf_buildings.iterrows():
+        geom = row['geometry']
+        if isinstance(geom, shapely.geometry.Polygon):
+            exterior = list(geom.exterior.coords)
+            model_coords = [to_model_xy(lon, lat) for (lon, lat) in exterior]
+            height = get_building_height(row, default_height) * height_scale
+            _add_prism_from_polygon(model_coords, base_thickness, base_thickness + height, vertices, faces)
+        elif isinstance(geom, shapely.geometry.MultiPolygon):
+            for poly in geom.geoms:
+                exterior = list(poly.exterior.coords)
+                model_coords = [to_model_xy(lon, lat) for (lon, lat) in exterior]
                 height = get_building_height(row, default_height) * height_scale
-                print(f"Building at index {idx} with coordinates {exterior_coords} has height {height}")
+                _add_prism_from_polygon(model_coords, base_thickness, base_thickness + height, vertices, faces)
 
-                v_bottom = (x, y, base_thickness)
-                v_top = (x, y, height + base_thickness)
-                vertices.extend([v_bottom, v_top])
+    # model-space base rect for clipping
+    base_rect = shapely_box(0, 0, base_size, base_size)
 
-            # Create side faces
-            for i in range(len(exterior_coords) - 1):
-                bottom1 = base_index + 2 * i
-                bottom2 = base_index + 2 * (i + 1)
-                top1 = base_index + 2 * i + 1
-                top2 = base_index + 2 * (i + 1) + 1
+    # 3) Roads (optional) — per-edge buffering/extrusion (no union)
+    if roads_gdf is not None and len(roads_gdf) > 0:
+        from shapely.geometry import GeometryCollection, MultiPolygon, Polygon
 
-                faces.append([bottom1, bottom2, top1])
-                faces.append([top1, bottom2, top2])
+        # model-space base rect for clipping (if not already defined above)
+        base_rect = shapely_box(0, 0, base_size, base_size)
+        base_area = base_size * base_size
 
-            # Create top face
-            top_face_indices = [base_index + 2 * i + 1 for i in range(len(exterior_coords) - 1)]
-            for i in range(1, len(top_face_indices) - 1):
-                faces.append([top_face_indices[0], top_face_indices[i], top_face_indices[i + 1]])
+        def line_to_model_linestring(line):
+            if isinstance(line, LineString):
+                return LineString([to_model_xy(lon, lat) for (lon, lat) in line.coords])
+            elif isinstance(line, MultiLineString):
+                return MultiLineString([
+                    LineString([to_model_xy(lon, lat) for (lon, lat) in seg.coords])
+                    for seg in line.geoms
+                ])
+            return None
 
-            # Create bottom face (this was omitted in the previous version)
-            bottom_face_indices = [base_index + 2 * i for i in range(len(exterior_coords) - 1)]
-            for i in range(1, len(bottom_face_indices) - 1):
-                faces.append([bottom_face_indices[0], bottom_face_indices[i], bottom_face_indices[i + 1]])
+        # ---- tuning knobs ----
+        UNIFORM_WIDTH_MM = 0.8      # start ~0.6–1.0 mm at your scale
+        z0 = base_thickness + EPS   # EPS ~ 0.02 keeps roads from fusing with base
+        z1 = z0 + road_height_mm    # e.g., 1.4–1.8 mm looks nice
+        MIN_AREA = 0.012            # ignore dust polygons (mm^2)
+        SIMPLIFY = 0.03             # shave micro-spikes (mm)
+        # ----------------------
 
-    vertices = np.array(vertices)
-    faces = np.array(faces)
+        def iter_polys(g):
+            if g.is_empty:
+                return
+            if isinstance(g, Polygon):
+                yield g
+            elif isinstance(g, MultiPolygon):
+                for p in g.geoms:
+                    yield p
+            elif isinstance(g, GeometryCollection):
+                for p in g.geoms:
+                    yield from iter_polys(p)
 
-    return vertices, faces
+        total_area = 0.0
+        count = 0
+
+        for _, erow in roads_gdf.iterrows():
+            mg = line_to_model_linestring(erow.geometry)
+            if mg is None or mg.is_empty:
+                continue
+
+            # buffer this ONE edge (half-width)
+            buf = mg.buffer(UNIFORM_WIDTH_MM / 2.0, cap_style=2, join_style=2)
+            if buf.is_empty:
+                continue
+
+            # clip to base; clean tiny self-intersections; simplify a hair
+            buf = buf.intersection(base_rect)
+            if buf.is_empty:
+                continue
+            buf = buf.buffer(0)
+            if SIMPLIFY > 0:
+                buf = buf.simplify(SIMPLIFY)
+
+            # extrude ONLY polygon parts (no union!)
+            for poly in iter_polys(buf):
+                if poly.is_empty:
+                    continue
+                a = poly.area
+                if a < MIN_AREA:
+                    continue
+                total_area += a
+                count += 1
+                _add_prism_from_polygon_TRIANGULATED(poly, z0, z1, vertices, faces)
+
+        # diagnostics (non-union coverage)
+        try:
+            print(f"[roads-per-edge] pieces = {count}, summed_coverage = {total_area/base_area:.3f}")
+        except Exception:
+            pass
+
+    return np.array(vertices), np.array(faces)
 
 def save_to_stl(vertices, faces, filename):
     mesh_data = mesh.Mesh(np.zeros(faces.shape[0], dtype=mesh.Mesh.dtype))
@@ -135,11 +306,25 @@ def save_to_stl(vertices, faces, filename):
     mesh_data.save(filename)
 
 def main():
-    #bbox = (37.8049, -122.3894, 37.7749, -122.4194)  # (north_lat, north_lng, south_lat, south_lng) #san francisco example
-    bbox = (33.767759, -84.381932, 33.753296, -84.402845) #atlanta example
-    gdf = fetch_building_data(bbox)
-    vertices, faces = scale_coordinates(gdf, bbox, target_size=180, max_height_mm=40, default_height=40, base_thickness=2)
-    save_to_stl(vertices, faces, 'buildings_with_base.stl')
+    # bbox = (north, east, south, west)
+    bbox = (39.9615, -75.1520, 39.9435, -75.1750)  # Center City Philadelphia ~2km box
+
+    buildings = fetch_building_data(bbox)
+    roads = fetch_road_data(bbox, network_type='drive')
+
+    vertices, faces = scale_coordinates(
+        buildings,
+        bbox,
+        target_size=180,
+        max_height_mm=40,
+        default_height=40,
+        base_thickness=1.8,
+        roads_gdf=roads,
+        road_width_mm=3.0,     # tweak to taste
+        road_height_mm=1.6     # shallow relief
+    )
+
+    save_to_stl(vertices, faces, 'city_with_roads_and_buildings.stl')
 
 if __name__ == "__main__":
     main()
