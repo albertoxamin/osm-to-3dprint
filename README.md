@@ -166,7 +166,7 @@ width_map = {
 
 ## Example outputs
 
-*(Add your latest screenshots here once you’re happy with the look — especially a slicer layer view showing roads as raised terraces.)*
+<img width="1568" height="1126" alt="image" src="https://github.com/user-attachments/assets/94556dd6-c717-49a0-b02d-5f8fadb54c7f" />
 
 ---
 
