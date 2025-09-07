@@ -8,7 +8,7 @@ Now supports **streets** (buffered & extruded roadbeds) in addition to buildings
 - **Printer-friendly:** Models are watertight and tuned for slicers.
 - **Fast:** Typical city tiles generate in under a minute.
 
-Support the project by grabbing a 3D print from **[Plan3DPrint.com](https://plan3dprint.com/)**!
+Support the project by grabbing a 3D print from **[Etsy.com](https://www.etsy.com/listing/1760573334/3d-printed-city-map)**!
 
 ---
 
@@ -25,6 +25,9 @@ Support the project by grabbing a 3D print from **[Plan3DPrint.com](https://plan
 > Tip: At ~2 km mapped to ~180–200 mm, **1 mm ≈ 9–11 m**. Start with **0.6–1.0 mm** for residential roads.
 
 ---
+
+<img width="1635" height="1267" alt="image" src="https://github.com/user-attachments/assets/1903c350-e4db-41e5-9776-46dc2d1f0305" />
+Downtown Philly ^^
 
 ## Installation
 
