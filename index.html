@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OSM to 3D Print - Web App</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🗺️ OSM to 3D Print</h1>
+            <p>Export OpenStreetMap features to STL for 3D printing</p>
+        </header>
+
+        <div class="main-content">
+            <div class="left-column">
+                <div class="controls-panel">
+                    <h2>Configuration</h2>
+                    
+                    <div class="input-group">
+                        <label for="city-search">Search by City Name</label>
+                        <div class="city-search-container">
+                            <input type="text" id="city-search" placeholder="e.g., Philadelphia, New York, London..." list="city-suggestions">
+                            <button id="search-city-btn" class="btn-secondary">Search</button>
+                        </div>
+                        <small>Enter a city name to automatically set the bounding box</small>
+                        <div id="city-search-results" class="search-results"></div>
+                    </div>
+                    
+                    <div class="input-group">
+                        <label for="bbox-north">Bounding Box (North, East, South, West)</label>
+                        <div class="bbox-inputs">
+                            <input type="number" id="bbox-north" placeholder="North (lat)" value="39.9615" step="0.0001">
+                            <input type="number" id="bbox-east" placeholder="East (lon)" value="-75.1520" step="0.0001">
+                            <input type="number" id="bbox-south" placeholder="South (lat)" value="39.9435" step="0.0001">
+                            <input type="number" id="bbox-west" placeholder="West (lon)" value="-75.1750" step="0.0001">
+                        </div>
+                        <button id="update-map-btn" class="btn-secondary">Update Map Preview</button>
+                    </div>
+
+                <div class="input-group">
+                    <label for="target-size">Target Size (mm)</label>
+                    <input type="number" id="target-size" value="180" min="50" max="500" step="10">
+                    <small>Width of the modeled area on your print bed</small>
+                </div>
+
+                <div class="input-group">
+                    <label for="max-height">Max Building Height (mm)</label>
+                    <input type="number" id="max-height" value="40" min="10" max="200" step="5">
+                </div>
+
+                <div class="input-group">
+                    <label for="default-height">Default Building Height (m)</label>
+                    <input type="number" id="default-height" value="10" min="3" max="50" step="1">
+                </div>
+
+                <div class="input-group">
+                    <label for="base-thickness">Base Thickness (mm)</label>
+                    <input type="number" id="base-thickness" value="1.8" min="0.5" max="10" step="0.1">
+                </div>
+
+                <div class="input-group">
+                    <label>
+                        <input type="checkbox" id="include-roads" checked>
+                        Include Roads
+                    </label>
+                </div>
+
+                <div class="input-group" id="roads-settings">
+                    <label for="road-width">Road Width (mm)</label>
+                    <input type="number" id="road-width" value="0.8" min="0.3" max="5" step="0.1">
+                    
+                    <label for="road-height">Road Height (mm)</label>
+                    <input type="number" id="road-height" value="1.6" min="0.5" max="5" step="0.1">
+                </div>
+
+                <div class="input-group">
+                    <label>
+                        <input type="checkbox" id="include-greens">
+                        Include Green Spaces (Parks, Vegetation)
+                    </label>
+                </div>
+
+                <div class="input-group">
+                    <label>
+                        <input type="checkbox" id="include-water">
+                        Include Water Bodies
+                    </label>
+                </div>
+
+                <div class="input-group">
+                    <label>
+                        <input type="checkbox" id="multi-material" checked>
+                        Multi-Material Export (Separate STL files)
+                    </label>
+                    <small>Export separate STL files for buildings, roads, greens, and water for multi-color printing</small>
+                </div>
+
+                <div class="input-group">
+                    <label>
+                        <input type="checkbox" id="auto-generate" checked>
+                        Auto-generate when parameters change
+                    </label>
+                    <small>Automatically generate STL when you modify any parameter</small>
+                </div>
+
+                <div class="button-group">
+                    <button id="generate-btn" class="btn-primary">Generate STL</button>
+                </div>
+
+                <div id="stl-files-list" class="stl-files-list" style="display: none;">
+                    <h3>Generated STL Files</h3>
+                    <div id="stl-files-container" class="stl-files-container">
+                        <!-- Files will be added here dynamically -->
+                    </div>
+                </div>
+                </div>
+
+                <div class="output-panel">
+                    <h2>Status</h2>
+                    <div id="status" class="status">Ready to generate</div>
+                    <div id="progress" class="progress-bar" style="display: none;">
+                        <div id="progress-fill" class="progress-fill"></div>
+                    </div>
+                    <div id="log" class="log"></div>
+                </div>
+            </div>
+
+            <div class="right-column">
+                <div class="preview-panel">
+                    <h2>Map Preview</h2>
+                    <div class="map-controls">
+                        <button id="select-area-btn" class="btn-secondary">Select Area on Map</button>
+                        <button id="clear-selection-btn" class="btn-secondary" style="display: none;">Clear Selection</button>
+                    </div>
+                    <div id="map-preview" class="map-container"></div>
+                    <small class="map-hint">Click "Select Area on Map" then drag on the map to select your bounding box</small>
+                </div>
+
+                <div class="preview-panel">
+                    <h2>3D Model Preview</h2>
+                    <div id="stl-preview" class="stl-container">
+                        <div class="preview-placeholder">Generate an STL to see 3D preview</div>
+                    </div>
+                    <div class="preview-controls">
+                        <button id="reset-camera-btn" class="btn-secondary">Reset Camera</button>
+                        <label>
+                            <input type="checkbox" id="wireframe-toggle"> Wireframe
+                        </label>
+                    </div>
+                    <div class="color-controls">
+                        <h3>Layer Colors</h3>
+                        <div class="color-pickers">
+                            <div class="color-picker-item">
+                                <label for="color-buildings">Buildings:</label>
+                                <input type="color" id="color-buildings" value="#8B4513">
+                            </div>
+                            <div class="color-picker-item">
+                                <label for="color-roads">Roads:</label>
+                                <input type="color" id="color-roads" value="#333333">
+                            </div>
+                            <div class="color-picker-item">
+                                <label for="color-greens">Greens:</label>
+                                <input type="color" id="color-greens" value="#228B22">
+                            </div>
+                            <div class="color-picker-item">
+                                <label for="color-water">Water:</label>
+                                <input type="color" id="color-water" value="#1E90FF">
+                            </div>
+                        </div>
+                        <button id="apply-colors-btn" class="btn-secondary">Apply Colors</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Libraries -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    
+    <!-- Geometry Processing Modules -->
+    <script src="geometry-processor.js"></script>
+    <script src="stl-generator.js"></script>
+    
+    <!-- Main Application -->
+    <script src="app.js"></script>
+</body>
+</html>
+
